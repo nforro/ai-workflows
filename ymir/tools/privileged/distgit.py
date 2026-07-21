@@ -202,7 +202,8 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                     result=f"Z-Stream branch {branch} already exists, no need to create it"
                 )
         except Exception as e:
-            raise ToolError(f"Failed to check GitLab remote: {_sanitize_url(str(e))}") from e
+            logger.error("Failed to check GitLab remote: %s", _sanitize_url(str(e)))
+            raise ToolError("Failed to check GitLab remote") from e
         try:
             with tempfile.TemporaryDirectory() as path:
                 # Username is taken from the Kerberos principal and embedded in
@@ -215,7 +216,11 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                         shutil.rmtree(clone_dest)
                     return await asyncio.to_thread(git.Repo.clone_from, clone_url, clone_dest)
 
-                repo = await _retry_transient(_clone, f"clone {package} from dist-git")
+                try:
+                    repo = await _retry_transient(_clone, f"clone {package} from dist-git")
+                except Exception as e:
+                    logger.error("Failed to clone dist-git repo for %s: %s", package, _sanitize_url(str(e)))
+                    raise ToolError("Failed to clone dist-git repo") from e
                 if branch in [ref.name.split("/")[-1] for ref in repo.remotes.origin.refs]:
                     # Branch already exists in dist-git but not yet mirrored to GitLab.
                     # This happens when a previous push succeeded server-side but the SSH
@@ -226,10 +231,16 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                         "skipping push and waiting for mirror sync"
                     )
                 else:
-                    if await is_older_zstream(branch):
-                        _, ref = await get_latest_z_pending_build(package, branch)
-                    else:
-                        _, ref = await get_latest_candidate_build(package, branch)
+                    try:
+                        if await is_older_zstream(branch):
+                            _, ref = await get_latest_z_pending_build(package, branch)
+                        else:
+                            _, ref = await get_latest_candidate_build(package, branch)
+                    except Exception as e:
+                        logger.error(
+                            "Failed to find candidate build for %s: %s", package, _sanitize_url(str(e))
+                        )
+                        raise ToolError("Failed to find candidate build") from e
                     if source_branch := self._find_source_branch(repo, branch):
                         ref = await self._find_latest_same_nvr_ref(
                             repo,
@@ -237,13 +248,20 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                             ref,
                             source_branch,
                         )
-                    push_infos = await _retry_transient(
-                        lambda: asyncio.to_thread(repo.remotes.origin.push, f"{ref}:refs/heads/{branch}"),
-                        f"push {branch} to dist-git",
-                    )
+                    try:
+                        push_infos = await _retry_transient(
+                            lambda: asyncio.to_thread(repo.remotes.origin.push, f"{ref}:refs/heads/{branch}"),
+                            f"push {branch} to dist-git",
+                        )
+                    except Exception as e:
+                        logger.error("Failed to push %s to dist-git: %s", branch, _sanitize_url(str(e)))
+                        raise ToolError("Failed to push branch to dist-git") from e
+                    if getattr(push_infos, "error", None):
+                        logger.error("git push stderr: %s", _sanitize_url(str(push_infos.error)))
                     for info in push_infos:
                         if info.flags & git.remote.PushInfo.ERROR:
-                            raise RuntimeError(f"Push rejected: {info.summary.strip()}")
+                            logger.error("Push to dist-git rejected: %s", info.summary.strip())
+                            raise ToolError("Push to dist-git was rejected")
                 start_time = time.monotonic()
                 while time.monotonic() - start_time < SYNC_TIMEOUT:
                     try:
@@ -253,15 +271,23 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                             return StringToolOutput(result=f"Successfully created Z-Stream branch {branch}")
                     except git.exc.GitCommandError as e:
                         if not _is_transient_git_error(e):
-                            raise
+                            logger.error("Failed to poll GitLab mirror: %s", _sanitize_url(str(e)))
+                            raise ToolError("Failed to poll GitLab mirror") from e
                         logger.warning(f"Transient error polling GitLab mirror sync: {_sanitize_url(str(e))}")
                     elapsed = int(time.monotonic() - start_time)
                     logger.info(
                         f"Waiting for GitLab mirror sync of {package} branch {branch} ({elapsed}s elapsed)"
                     )
                     await asyncio.sleep(30)
-                raise RuntimeError(
-                    f"The {branch} branch wasn't synced to GitLab after {SYNC_TIMEOUT} seconds"
+                logger.error(
+                    "GitLab mirror sync timed out for %s branch %s after %ds",
+                    package,
+                    branch,
+                    SYNC_TIMEOUT,
                 )
+                raise ToolError("GitLab mirror sync timed out")
+        except ToolError:
+            raise
         except Exception as e:
-            raise ToolError(f"Failed to create Z-Stream branch: {_sanitize_url(str(e))}") from e
+            logger.error("Failed to create Z-Stream branch: %s", _sanitize_url(str(e)))
+            raise ToolError("Failed to create Z-Stream branch") from e
