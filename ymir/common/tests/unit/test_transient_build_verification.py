@@ -96,6 +96,6 @@ async def test_buildroot_transport_error_is_retryable():
     flexmock(config).should_receive("load_rhel_config").replace_with(rhel_config)
     flexmock(utils).should_receive("_resolve_buildroot_checks").and_return([("hub", "tag")])
     flexmock(utils).should_receive("_get_latest_koji_build").and_raise(utils.koji.GenericError("test outage"))
-    build = utils.ResolvedBrewBuild({"name": "dep", "epoch": 1, "version": "1", "release": "1.el9"})
+    build = utils.BrewBuild({"name": "dep", "epoch": 1, "version": "1", "release": "1.el9"})
     with pytest.raises(utils.TransientInfrastructureError, match="test outage"):
-        await utils.check_build_in_buildroot("rhel-9", "dep", build)
+        await utils.check_build_in_buildroot("rhel-9", "dep", build.nevr)

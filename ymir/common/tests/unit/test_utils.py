@@ -6,7 +6,7 @@ import httpx
 import koji
 import pytest
 from flexmock import flexmock
-from specfile.utils import EVR, NEVR, NEVRA
+from specfile.utils import NEVR, NEVRA
 
 import ymir.common.utils as _ymir_utils
 from ymir.common.base_utils import KerberosError, extract_principal, init_kerberos_ticket
@@ -546,7 +546,7 @@ async def test_get_latest_candidate_build_picks_higher_evr():
         {"source": "git+https://pkgs.example.com/rpms/bash#abc123"},
     )
     evr, ref = await get_latest_candidate_build("bash", "rhel-9.6.0")
-    assert evr == EVR(epoch=0, version="1.0", release="2.el9")
+    assert evr == NEVR(name="bash", epoch=0, version="1.0", release="2.el9")
     assert ref == "abc123"
 
 
@@ -562,7 +562,7 @@ async def test_get_latest_candidate_build_only_candidate():
         {"source": "git+https://pkgs.example.com/rpms/bash#def456"},
     )
     evr, ref = await get_latest_candidate_build("bash", "rhel-9.6.0")
-    assert evr == EVR(epoch=0, version="1.0", release="1.el9")
+    assert evr == NEVR(name="bash", epoch=0, version="1.0", release="1.el9")
     assert ref == "def456"
 
 
@@ -592,7 +592,7 @@ async def test_get_latest_z_pending_build():
         {"source": "git+https://pkgs.example.com/rpms/bash#abc123"},
     )
     evr, ref = await get_latest_z_pending_build("bash", "rhel-9.6.0")
-    assert evr == EVR(epoch=0, version="1.0", release="1.el9")
+    assert evr == NEVR(name="bash", epoch=0, version="1.0", release="1.el9")
     assert ref == "abc123"
 
 
@@ -619,7 +619,7 @@ async def test_get_latest_buildroot_build():
 
     evr, ref = await get_latest_buildroot_build("bash", "rhel-9.6.0")
 
-    assert evr == EVR(epoch=0, version="1.0", release="1.el9")
+    assert evr == NEVR(name="bash", epoch=0, version="1.0", release="1.el9")
     assert ref == "abc123"
 
 
@@ -2868,9 +2868,9 @@ async def test_installed_pkgs_sample_epoch_and_subpackage(parser_koji_metadata):
 
 
 @pytest.mark.asyncio
-async def test_resolve_binary_rpm_to_source_rpm_success():
-    """Test _resolve_binary_rpm_to_source_rpm uses getRPM to resolve binary to source."""
-    from ymir.common.utils import _resolve_binary_rpm_to_source_rpm
+async def test_get_source_nevr_success():
+    """Test _get_source_nevr uses getRPM to resolve a binary RPM to its source."""
+    from ymir.common.utils import _get_source_nevr
 
     mock_session = flexmock()
     mock_session.should_receive("getRPM").with_args(
@@ -2881,7 +2881,7 @@ async def test_resolve_binary_rpm_to_source_rpm_success():
     )
     flexmock(koji).should_receive("ClientSession").and_return(mock_session)
 
-    result = await _resolve_binary_rpm_to_source_rpm(
+    result = await _get_source_nevr(
         "https://brewhub.example.com", NEVRA.from_string("perl-Errno-1.37-2.el10.x86_64"), "perl"
     )
 
@@ -2893,15 +2893,15 @@ async def test_resolve_binary_rpm_to_source_rpm_success():
 
 
 @pytest.mark.asyncio
-async def test_resolve_binary_rpm_to_source_rpm_not_found():
-    """Test _resolve_binary_rpm_to_source_rpm returns None when RPM not in Koji."""
-    from ymir.common.utils import _resolve_binary_rpm_to_source_rpm
+async def test_get_source_nevr_not_found():
+    """Test _get_source_nevr returns None when the RPM is not in Koji."""
+    from ymir.common.utils import _get_source_nevr
 
     mock_session = flexmock()
     mock_session.should_receive("getRPM").and_return([])
     flexmock(koji).should_receive("ClientSession").and_return(mock_session)
 
-    result = await _resolve_binary_rpm_to_source_rpm(
+    result = await _get_source_nevr(
         "https://brewhub.example.com", NEVRA.from_string("missing-pkg-1.0-1.el10.x86_64"), "missing"
     )
 
@@ -2985,7 +2985,7 @@ async def test_parse_dependency_conflicting_versions_returns_none(parser_koji_me
         call_count["n"] += 1
         return original_versions[idx]
 
-    flexmock(_ymir_utils).should_receive("_resolve_binary_rpm_to_source_rpm").replace_with(mock_resolve)
+    flexmock(_ymir_utils).should_receive("_get_source_nevr").replace_with(mock_resolve)
 
     log = "golang-1.21.0-1.el10.x86_64 1 2 abc installed\ngolang-bin-1.22.7-1.el10.x86_64 1 2 abc installed\n"
 
@@ -3858,7 +3858,7 @@ async def test_old_build_retries_brew_outage(monkeypatch):
         return [("RHEL-1", "pkg-1-1.el8")], []
 
     async def select(*_args):
-        return _ymir_utils.ResolvedBrewBuild(
+        return _ymir_utils.BrewBuild(
             {
                 "name": "pkg",
                 "epoch": 0,
@@ -3896,7 +3896,7 @@ async def test_fixed_dependency_lookup_failure_retries(monkeypatch):
         return [("RHEL-1", "pkg-1-1.el8")], []
 
     async def select(*_args):
-        return _ymir_utils.ResolvedBrewBuild(
+        return _ymir_utils.BrewBuild(
             {
                 "name": "pkg",
                 "epoch": 0,
@@ -3978,17 +3978,14 @@ async def test_check_package_built_filtered_active_empty_no_false_transient_erro
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("latest_epoch, expected", [(0, False), (2, True)])
-async def test_check_build_in_buildroot_resolves_epoch_from_brew(latest_epoch, expected):
-    """Jira NVRs omit epoch; Brew's epoch must govern buildroot comparisons."""
+async def test_check_build_in_buildroot_compares_authoritative_nevrs(latest_epoch, expected):
+    """Buildroot comparisons use the authoritative fixed-build NEVR."""
     import ymir.common.config as config
 
     flexmock(config).should_receive("load_rhel_config").and_return(_coro({}))
     flexmock(_ymir_utils).should_receive("_resolve_buildroot_checks").and_return(
         [("https://koji.example", "buildroot-tag")]
     )
-    flexmock(_ymir_utils).should_receive("_get_koji_build").with_args(
-        _ymir_utils.BREWHUB_URL, "pkg-1.0-1.el10"
-    ).and_return({"name": "pkg", "epoch": 2, "version": "1.0", "release": "1.el10"})
     flexmock(_ymir_utils).should_receive("_get_latest_koji_build").with_args(
         "https://koji.example", "buildroot-tag", "pkg"
     ).and_return(
@@ -4001,7 +3998,10 @@ async def test_check_build_in_buildroot_resolves_epoch_from_brew(latest_epoch, e
         }
     )
 
-    assert await _ymir_utils.check_build_in_buildroot("rhel-10.0", "pkg", "pkg-1.0-1.el10") is expected
+    fixed_build = _ymir_utils.BrewBuild(
+        {"name": "pkg", "epoch": 2, "version": "1.0", "release": "1.el10"}
+    )
+    assert await _ymir_utils.check_build_in_buildroot("rhel-10.0", "pkg", fixed_build.nevr) is expected
 
 
 @pytest.fixture
@@ -4061,7 +4061,7 @@ async def test_binary_lookup_selects_matching_epoch(epoch):
     ).once()
     flexmock(koji).should_receive("ClientSession").and_return(session)
 
-    result = await _ymir_utils._resolve_binary_rpm_to_source_rpm(
+    result = await _ymir_utils._get_source_nevr(
         _ymir_utils.BREWHUB_URL,
         NEVRA.from_string(f"dep-libs-{epoch}:1-1.el10.x86_64"),
         "dep",
@@ -4081,7 +4081,7 @@ async def test_binary_lookup_requires_unambiguous_epoch(records):
     flexmock(koji).should_receive("ClientSession").and_return(session)
 
     assert (
-        await _ymir_utils._resolve_binary_rpm_to_source_rpm(
+        await _ymir_utils._get_source_nevr(
             _ymir_utils.BREWHUB_URL, NEVRA.from_string("dep-libs-2:1-1.el10.x86_64"), "dep"
         )
         is None
@@ -4130,7 +4130,7 @@ async def test_closed_build_verified_despite_unresolved_active_build(active_meta
     flexmock(_ymir_utils).should_receive("_fetch_installed_pkgs_log").replace_with(
         lambda *_args, **_kwargs: _coro([("https://brew-files.example.test/x86_64/installed_pkgs.log", body)])
     ).once()
-    flexmock(_ymir_utils).should_receive("_resolve_binary_rpm_to_source_rpm").replace_with(
+    flexmock(_ymir_utils).should_receive("_get_source_nevr").replace_with(
         lambda *_args: _coro(NEVR(name="dep", epoch=0, version=version, release="1.el10"))
     )
 
@@ -4237,6 +4237,6 @@ async def test_binary_lookup_requires_valid_explicit_epoch(record):
     session.should_receive("getBuild").never()
     flexmock(koji).should_receive("ClientSession").and_return(session)
     with pytest.raises(_ymir_utils.PermanentValidationError, match="Invalid Brew source metadata"):
-        await _ymir_utils._resolve_binary_rpm_to_source_rpm(
+        await _ymir_utils._get_source_nevr(
             _ymir_utils.BREWHUB_URL, NEVRA.from_string("dep-libs-1-1.el10.x86_64"), "dep"
         )
